@@ -1,0 +1,17 @@
+[project]
+name = "mcp-fetch"
+version = "0.1.2"
+description = "Minimal MCP server providing a generic HTTP request tool with chunked responses and caching."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastmcp",
+  "httpx>=0.27.0",
+]
+
+[project.scripts]
+mcp-fetch = "mcp_fetch.server:main"
+
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"

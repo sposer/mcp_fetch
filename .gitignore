@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.mcp-fetch-cache/
+.venv/
+.idea/
+dist/
+build/
+*.egg-info/
+*.lock
