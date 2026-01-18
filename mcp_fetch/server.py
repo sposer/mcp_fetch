@@ -1,218 +1,472 @@
 from __future__ import annotations
 
-import time
+import asyncio
+import atexit
+import logging
 import os
 import sys
-from typing import Any, Dict, Optional, Tuple
+import time
+from typing import Any, Dict, Optional
 from urllib.parse import urlencode, urlparse, urlunparse
 
+import httpx
 from fastmcp import FastMCP
 
 from .cache import CacheConfig, TransferCache, encode_chunk_for_json
+from .converter import html_to_markdown
+from .crawler import close_default_crawler, get_default_crawler
+from .logging_utils import configure_logging
 
 
 def _only_http_https(url: str) -> None:
-	parsed = urlparse(url)
-	if parsed.scheme not in ("http", "https"):
-		raise ValueError("Only http/https URLs are supported")
-	if not parsed.netloc:
-		raise ValueError("URL missing host")
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http/https URLs are supported")
+    if not parsed.netloc:
+        raise ValueError("URL missing host")
 
 
 def _merge_query(url: str, query: Optional[Dict[str, Any]]) -> str:
-	if not query:
-		return url
-	parsed = urlparse(url)
-	existing = parsed.query
-	added = urlencode({k: str(v) for k, v in query.items() if v is not None}, doseq=True)
-	combined = existing
-	if combined and added:
-		combined = combined + "&" + added
-	elif added:
-		combined = added
-	return urlunparse(parsed._replace(query=combined))
-
-
-def _parse_body(
-	*,
-	json_body: Any,
-	form: Optional[Dict[str, Any]],
-	text: Optional[str],
-	bytes_base64: Optional[str],
-	content_type: Optional[str],
-) -> Tuple[Optional[bytes], Dict[str, str]]:
-	headers: Dict[str, str] = {}
-	content: Optional[bytes] = None
-
-	if json_body is not None:
-		import json as _json
-
-		content = _json.dumps(json_body, ensure_ascii=False).encode("utf-8")
-		headers["content-type"] = "application/json; charset=utf-8"
-	elif form is not None:
-		if not isinstance(form, dict):
-			raise ValueError("`form` must be an object")
-		content = urlencode({k: str(v) for k, v in form.items()}).encode("utf-8")
-		headers["content-type"] = "application/x-www-form-urlencoded; charset=utf-8"
-	elif text is not None:
-		if not isinstance(text, str):
-			raise ValueError("`text` must be a string")
-		content = text.encode("utf-8")
-		headers["content-type"] = str(content_type or "text/plain; charset=utf-8")
-	elif bytes_base64 is not None:
-		import base64
-
-		if not isinstance(bytes_base64, str):
-			raise ValueError("`bytes_base64` must be a string")
-		try:
-			content = base64.b64decode(bytes_base64, validate=True)
-		except Exception:
-			raise ValueError("Invalid base64 for `bytes_base64`")
-		if content_type:
-			headers["content-type"] = str(content_type)
-
-	return content, headers
+    if not query:
+        return url
+    parsed = urlparse(url)
+    existing = parsed.query
+    added = urlencode({k: str(v) for k, v in query.items() if v is not None}, doseq=True)
+    combined = existing
+    if combined and added:
+        combined = combined + "&" + added
+    elif added:
+        combined = added
+    return urlunparse(parsed._replace(query=combined))
 
 
 _config = CacheConfig()
 _cache = TransferCache(_config)
 
+configure_logging()
+_log = logging.getLogger("mcp_fetch.server")
+
 mcp = FastMCP("mcp-fetch")
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=30.0,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+            verify=False,
+            trust_env=True,
+        )
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    global _http_client
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
+
+
+async def _read_chunk_impl(
+        transfer_id: str, offset: int, chunk_bytes: int, to_markdown: bool = False
+) -> Dict[str, Any]:
+    transfer = await _cache.get(transfer_id)
+    if transfer is None:
+        return {"ok": False, "error": {"type": "not_found", "message": "Unknown transfer_id"}}
+
+    data, next_offset, done = await transfer.read_chunk(
+        offset=int(offset or 0), size=chunk_bytes, wait_timeout_seconds=_config.wait_chunk_timeout_seconds
+    )
+    payload: Dict[str, Any] = {
+        "ok": transfer.error is None,
+        "transfer_id": transfer.transfer_id,
+        "offset": int(offset or 0),
+        "next_offset": next_offset if data else None,
+        "done": bool(done and next_offset >= transfer.available_bytes),
+        "available_bytes": transfer.available_bytes,
+        "total_bytes": transfer.total_bytes,
+        "status": transfer.status,
+        "headers": transfer.headers,
+        "final_url": transfer.final_url,
+        "content_type": transfer.content_type,
+        "truncated": transfer.truncated,
+        "error": transfer.error,
+        "to_markdown": bool(to_markdown),
+    }
+    payload.update(encode_chunk_for_json(data, transfer.content_type))
+    return payload
+
+
+async def _fetch_page_impl(
+        url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        query: Optional[Dict[str, Any]] = None,
+        timeout_ms: float = 30000,
+        to_markdown: bool = True,
+        wait_selector: Optional[str] = None,
+        max_scrolls: int = 8,
+        min_delay_ms: int = 150,
+        max_delay_ms: int = 450,
+        proxy: Optional[str] = None,
+        proxy_pool: Optional[list[str]] = None,
+        user_agent: Optional[str] = None,
+        chunk_bytes: int = 262144,
+        transfer_id: Optional[str] = None,
+        offset: int = 0,
+) -> Dict[str, Any]:
+    chunk_bytes = int(chunk_bytes or 262144)
+    if chunk_bytes <= 0:
+        chunk_bytes = 1
+
+    if transfer_id:
+        return await _read_chunk_impl(transfer_id, offset, chunk_bytes, to_markdown)
+
+    if not url:
+        raise ValueError("`url` is required")
+
+    url = _merge_query(url, query)
+    _only_http_https(url)
+
+    headers_obj = headers or {}
+    if not isinstance(headers_obj, dict):
+        raise ValueError("`headers` must be an object")
+    request_headers = {str(k): str(v) for k, v in headers_obj.items() if v is not None}
+
+    if timeout_ms <= 0:
+        timeout_ms = 30000
+
+    start_time = time.time()
+    crawler = await get_default_crawler()
+    result = await crawler.fetch_html(
+        url=url,
+        headers=request_headers,
+        timeout_ms=timeout_ms,
+        wait_selector=wait_selector,
+        max_scrolls=max_scrolls,
+        min_delay_ms=min_delay_ms,
+        max_delay_ms=max_delay_ms,
+        proxy=proxy,
+        proxy_pool=proxy_pool,
+        user_agent=user_agent,
+    )
+    elapsed_ms = int((time.time() - start_time) * 1000)
+
+    if not result.ok:
+        raise RuntimeError(
+            f"{result.error.get('type') if result.error else 'Error'}: {result.error.get('message') if result.error else 'unknown'}"
+        )
+
+    html = result.html
+    content: str
+    content_type: str
+    if bool(to_markdown):
+        content = html_to_markdown(html)
+        content_type = "text/markdown; charset=utf-8"
+    else:
+        content = html
+        content_type = "text/html; charset=utf-8"
+
+    transfer = await _cache.create_transfer(
+        final_url=result.final_url,
+        status=result.status,
+        headers=result.headers,
+        content_type=content_type,
+        content=content.encode("utf-8"),
+    )
+    data, next_offset, done = await transfer.read_chunk(offset=0, size=chunk_bytes, wait_timeout_seconds=0)
+
+    payload = {
+        "ok": True,
+        "transfer_id": transfer.transfer_id,
+        "offset": 0,
+        "next_offset": next_offset if data else None,
+        "done": bool(done and next_offset >= transfer.available_bytes),
+        "available_bytes": transfer.available_bytes,
+        "total_bytes": transfer.total_bytes,
+        "status": transfer.status,
+        "headers": transfer.headers,
+        "final_url": transfer.final_url,
+        "content_type": transfer.content_type,
+        "truncated": transfer.truncated,
+        "elapsed_ms": elapsed_ms,
+        "error": None,
+        "to_markdown": bool(to_markdown),
+    }
+    payload.update(encode_chunk_for_json(data, transfer.content_type))
+    _log.info("fetch_page ok", extra={"url": url, "elapsed_ms": elapsed_ms, "status": transfer.status})
+    return payload
+
+
+@mcp.tool
+async def fetch_page(
+        url: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+        query: Optional[Dict[str, Any]] = None,
+        timeout_ms: float = 30000,
+        to_markdown: bool = True,
+        wait_selector: Optional[str] = None,
+        max_scrolls: int = 8,
+        min_delay_ms: int = 150,
+        max_delay_ms: int = 450,
+        proxy: Optional[str] = None,
+        proxy_pool: Optional[list[str]] = None,
+        user_agent: Optional[str] = None,
+        chunk_bytes: int = 48000,
+        transfer_id: Optional[str] = None,
+        offset: int = 0,
+) -> Dict[str, Any]:
+    """Fetch/Crawl a dynamic web page and convert to Markdown (supports JavaScript).
+
+    Use this tool to:
+    1. Crawl/Scrape content from modern web pages (React, Vue, etc.)
+    2. Get full page content after JavaScript rendering
+    3. Download large page content via chunked streaming
+    
+    Protocol:
+    1. Start: Provide url (required) → returns transfer_id + first chunk
+    2. Continue: Provide transfer_id + offset → returns next chunk
+
+    Args:
+      - url: Target http(s) URL (required for phase 1)
+      - to_markdown: Convert HTML to Markdown (default: True)
+      - wait_selector: CSS selector to wait for before capturing content
+      - Optional: headers, query, timeout_ms, max_scrolls,
+                  min/max_delay_ms, proxy/pool, user_agent, chunk_bytes
+      - Cursor: transfer_id, offset (for phase 2)
+
+    Returns:
+      - Chunk: chunk_text or chunk_base64, next_offset, done, truncated
+      - Meta: transfer_id, status, headers, final_url, content_type, elapsed_ms
+      - Size: available_bytes, total_bytes
+    """
+    return await _fetch_page_impl(
+        url=url,
+        headers=headers,
+        query=query,
+        timeout_ms=timeout_ms,
+        to_markdown=to_markdown,
+        wait_selector=wait_selector,
+        max_scrolls=max_scrolls,
+        min_delay_ms=min_delay_ms,
+        max_delay_ms=max_delay_ms,
+        proxy=proxy,
+        proxy_pool=proxy_pool,
+        user_agent=user_agent,
+        chunk_bytes=chunk_bytes,
+        transfer_id=transfer_id,
+        offset=offset,
+    )
+
+
+async def _http_request_impl(
+        url: Optional[str] = None,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        query: Optional[Dict[str, Any]] = None,
+        body: Optional[str] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        timeout_ms: float = 30000,
+        to_markdown: bool = True,
+        chunk_bytes: int = 262144,
+        transfer_id: Optional[str] = None,
+        offset: int = 0,
+) -> Dict[str, Any]:
+    chunk_bytes = int(chunk_bytes or 262144)
+    if chunk_bytes <= 0:
+        chunk_bytes = 1
+
+    if transfer_id:
+        return await _read_chunk_impl(transfer_id, offset, chunk_bytes, to_markdown=to_markdown)
+
+    if not url:
+        raise ValueError("`url` is required")
+
+    url = _merge_query(url, query)
+    _only_http_https(url)
+
+    if timeout_ms <= 0:
+        timeout_ms = 30000
+
+    client = await _get_http_client()
+    request_headers = {str(k): str(v) for k, v in (headers or {}).items() if v is not None}
+
+    max_retries = 3
+    last_error = None
+    start_time = time.time()
+
+    for attempt in range(max_retries):
+        try:
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=request_headers,
+                content=body,
+                json=json_body,
+                timeout=timeout_ms / 1000.0,
+            )
+            # Read full content for caching
+            content = await response.read()
+            elapsed_ms = int((time.time() - start_time) * 1000)
+
+            content_type = response.headers.get("content-type", "application/octet-stream")
+            if to_markdown and "text/html" in content_type.lower():
+                try:
+                    # httpx response.text automatically handles encoding detection
+                    content = html_to_markdown(response.text).encode("utf-8")
+                    content_type = "text/markdown; charset=utf-8"
+                except Exception:
+                    # Fallback to original content if conversion fails
+                    pass
+
+            transfer = await _cache.create_transfer(
+                final_url=str(response.url),
+                status=response.status_code,
+                headers=dict(response.headers),
+                content_type=content_type,
+                content=content,
+            )
+
+            data, next_offset, done = await transfer.read_chunk(offset=0, size=chunk_bytes, wait_timeout_seconds=0)
+
+            payload = {
+                "ok": True,
+                "transfer_id": transfer.transfer_id,
+                "offset": 0,
+                "next_offset": next_offset if data else None,
+                "done": bool(done and next_offset >= transfer.available_bytes),
+                "available_bytes": transfer.available_bytes,
+                "total_bytes": transfer.total_bytes,
+                "status": transfer.status,
+                "headers": transfer.headers,
+                "final_url": transfer.final_url,
+                "content_type": transfer.content_type,
+                "truncated": transfer.truncated,
+                "elapsed_ms": elapsed_ms,
+                "error": None,
+                "to_markdown": bool(to_markdown),
+            }
+            payload.update(encode_chunk_for_json(data, transfer.content_type))
+            _log.info("http_request ok", extra={"url": url, "elapsed_ms": elapsed_ms, "status": transfer.status})
+            return payload
+
+        except (httpx.TransportError, httpx.TimeoutException) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))
+            continue
+        except Exception as e:
+            raise RuntimeError(f"HTTP request failed: {str(e)}")
+
+    raise RuntimeError(f"HTTP request failed after {max_retries} retries: {str(last_error)}")
 
 
 @mcp.tool
 async def http_request(
-	method: str = "GET",
-	url: Optional[str] = None,
-	headers: Optional[Dict[str, str]] = None,
-	query: Optional[Dict[str, Any]] = None,
-	json: Any = None,
-	form: Optional[Dict[str, Any]] = None,
-	text: Optional[str] = None,
-	bytes_base64: Optional[str] = None,
-	content_type: Optional[str] = None,
-	timeout_ms: float = 30000,
-	follow_redirects: bool = False,
-	chunk_bytes: int = 262144,
-	transfer_id: Optional[str] = None,
-	offset: int = 0,
+        url: Optional[str] = None,
+        method: str = "GET",
+        headers: Optional[Dict[str, str]] = None,
+        query: Optional[Dict[str, Any]] = None,
+        body: Optional[str] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        timeout_ms: float = 30000,
+        to_markdown: bool = True,
+        chunk_bytes: int = 262144,
+        transfer_id: Optional[str] = None,
+        offset: int = 0,
 ) -> Dict[str, Any]:
-	"""Perform an HTTP request and return the response in chunks using a transfer_id cursor."""
+    """Perform a generic HTTP request (GET, POST, PUT, DELETE, etc) for APIs or raw data.
 
-	chunk_bytes = int(chunk_bytes or 262144)
-	if chunk_bytes <= 0:
-		chunk_bytes = 1
+    Use this tool when:
+    1. You need to call a REST API (JSON/XML)
+    2. You need to use HTTP methods other than GET (POST, PUT, DELETE)
+    3. You want to download a raw file without rendering (PDF, Image, etc)
 
-	if transfer_id:
-		transfer = await _cache.get(transfer_id)
-		if transfer is None:
-			return {"ok": False, "error": {"type": "not_found", "message": "Unknown transfer_id"}}
+    Note: For GET requests to renderable web pages, prefer `fetch_page` which handles dynamic content and JavaScript.
 
-		data, next_offset, done = await transfer.read_chunk(
-			offset=int(offset or 0), size=chunk_bytes, wait_timeout_seconds=_config.wait_chunk_timeout_seconds
-		)
-		payload: Dict[str, Any] = {
-			"ok": transfer.error is None,
-			"transfer_id": transfer.transfer_id,
-			"offset": int(offset or 0),
-			"next_offset": next_offset if data else None,
-			"done": bool(done and next_offset >= transfer.available_bytes),
-			"available_bytes": transfer.available_bytes,
-			"total_bytes": transfer.total_bytes,
-			"status": transfer.status,
-			"headers": transfer.headers,
-			"final_url": transfer.final_url,
-			"content_type": transfer.content_type,
-			"truncated": transfer.truncated,
-			"error": transfer.error,
-		}
-		payload.update(encode_chunk_for_json(data, transfer.content_type))
-		return payload
+    Protocol:
+    1. Start: Provide url (required) → returns transfer_id + first chunk
+    2. Continue: Provide transfer_id + offset → returns next chunk
+    """
+    return await _http_request_impl(
+        url=url,
+        method=method,
+        headers=headers,
+        query=query,
+        body=body,
+        json_body=json_body,
+        timeout_ms=timeout_ms,
+        to_markdown=to_markdown,
+        chunk_bytes=chunk_bytes,
+        transfer_id=transfer_id,
+        offset=offset,
+    )
 
-	if not url:
-		raise ValueError("`url` is required")
 
-	url = _merge_query(url, query)
-	_only_http_https(url)
-	method = str(method or "GET").upper()
+async def shutdown() -> Dict[str, Any]:
+    """Release browser resources early when embedding this server in a long-lived process."""
+    await close_default_crawler()
+    await _close_http_client()
+    return {"ok": True}
 
-	headers_obj = headers or {}
-	if not isinstance(headers_obj, dict):
-		raise ValueError("`headers` must be an object")
-	request_headers = {str(k): str(v) for k, v in headers_obj.items() if v is not None}
 
-	content, inferred_headers = _parse_body(
-		json_body=json,
-		form=form,
-		text=text,
-		bytes_base64=bytes_base64,
-		content_type=content_type,
-	)
-	for k, v in inferred_headers.items():
-		request_headers.setdefault(k, v)
+if os.environ.get("MCP_FETCH_EXPOSE_SHUTDOWN") == "1":
+    shutdown = mcp.tool(shutdown)
 
-	if timeout_ms <= 0:
-		timeout_ms = 30000
-	timeout_seconds = float(timeout_ms) / 1000.0
 
-	start_time = time.time()
-	transfer = await _cache.start_request(
-		method=method,
-		url=url,
-		headers=request_headers,
-		content=content,
-		timeout_seconds=timeout_seconds,
-		follow_redirects=bool(follow_redirects),
-	)
-	data, next_offset, done = await transfer.read_chunk(
-		offset=0, size=chunk_bytes, wait_timeout_seconds=_config.wait_chunk_timeout_seconds
-	)
-	elapsed_ms = int((time.time() - start_time) * 1000)
+async def _cleanup_all() -> None:
+    await close_default_crawler()
+    await _close_http_client()
 
-	# If the request failed before producing any bytes, surface it as a tool error so MCP sets `isError=true`.
-	if transfer.error is not None and not data:
-		raise RuntimeError(f"{transfer.error.get('type')}: {transfer.error.get('message')}")
 
-	payload = {
-		"ok": transfer.error is None,
-		"transfer_id": transfer.transfer_id,
-		"offset": 0,
-		"next_offset": next_offset if data else None,
-		"done": bool(done and next_offset >= transfer.available_bytes),
-		"available_bytes": transfer.available_bytes,
-		"total_bytes": transfer.total_bytes,
-		"status": transfer.status,
-		"headers": transfer.headers,
-		"final_url": transfer.final_url,
-		"content_type": transfer.content_type,
-		"truncated": transfer.truncated,
-		"elapsed_ms": elapsed_ms,
-		"error": transfer.error,
-	}
-	payload.update(encode_chunk_for_json(data, transfer.content_type))
-	return payload
+def _close_resources_sync() -> None:
+    try:
+        asyncio.run(_cleanup_all())
+    except RuntimeError:
+        try:
+            loop = asyncio.get_running_loop()
+        except Exception:
+            return
+        try:
+            loop.create_task(_cleanup_all())
+        except Exception:
+            return
 
 
 def main() -> None:
-	import argparse
+    import argparse
 
-	parser = argparse.ArgumentParser(add_help=True)
-	parser.add_argument("--transport", choices=["stdio", "http"], default=None)
-	parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_FETCH_PORT", "8000")))
-	parsed, _unknown = parser.parse_known_args()
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--transport", choices=["stdio", "http"], default=None)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_FETCH_PORT", "8000")))
+    parsed, _unknown = parser.parse_known_args()
 
-	transport = parsed.transport or os.environ.get("MCP_FETCH_TRANSPORT")
-	if not transport:
-		transport = "http" if sys.stdin.isatty() else "stdio"
+    transport = parsed.transport or os.environ.get("MCP_FETCH_TRANSPORT")
+    if not transport:
+        transport = "http" if sys.stdin.isatty() else "stdio"
 
-	if transport == "http":
-		mcp.run(transport="http", port=int(parsed.port))
-		return
+    logging.getLogger("fastmcp").setLevel(logging.WARNING)
+    logging.getLogger("fastmcp").propagate = False
 
-	try:
-		mcp.run()
-	except BaseException as e:
-		# When started without an MCP host, stdin may close immediately; FastMCP/anyio can surface this as CancelledError.
-		if type(e).__name__ == "CancelledError":
-			return
-		raise
+    atexit.register(_close_resources_sync)
+
+    if transport == "http":
+        try:
+            mcp.run(transport="http", port=int(parsed.port))
+        finally:
+            _close_resources_sync()
+        return
+
+    try:
+        try:
+            mcp.run()
+        finally:
+            _close_resources_sync()
+    except BaseException as e:
+        # When started without an MCP host, stdin may close immediately; FastMCP/anyio can surface this as CancelledError.
+        if type(e).__name__ == "CancelledError":
+            return
+        raise

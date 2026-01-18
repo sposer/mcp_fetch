@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from typing import Optional
+
+
+def _level_from_str(level: Optional[str]) -> int:
+    if not level:
+        return logging.INFO
+    upper = str(level).strip().upper()
+    return {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+    }.get(upper, logging.INFO)
+
+
+def configure_logging(*, level: Optional[str] = None) -> None:
+    log_level = _level_from_str(level or os.environ.get("MCP_FETCH_LOG_LEVEL"))
+    logging.basicConfig(
+        level=log_level,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    for noisy in ("fastmcp", "httpx", "playwright", "asyncio", "anyio"):
+        logger = logging.getLogger(noisy)
+        logger.setLevel(max(log_level, logging.WARNING))
+        logger.propagate = False
