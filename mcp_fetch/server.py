@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 from .base.env import env_bool, env_int, env_str
 from .base.logging import configure_logging
 from .cache import CacheConfig, TransferCache, encode_chunk_for_json
+from .cleaner import clean_html
 from .converter import html_to_markdown
 from .crawler import close_default_crawler, get_default_crawler
 
@@ -164,7 +165,8 @@ async def _fetch_page_impl(
     content: str
     content_type: str
     if bool(to_markdown):
-        content = html_to_markdown(html)
+        cleaned_html = clean_html(html)
+        content = html_to_markdown(cleaned_html)
         content_type = "text/markdown; charset=utf-8"
     else:
         content = html
@@ -316,7 +318,8 @@ async def _http_request_impl(
             if to_markdown and "text/html" in content_type.lower():
                 try:
                     # httpx response.text automatically handles encoding detection
-                    content = html_to_markdown(response.text).encode("utf-8")
+                    cleaned_html = clean_html(response.text)
+                    content = html_to_markdown(cleaned_html).encode("utf-8")
                     content_type = "text/markdown; charset=utf-8"
                 except Exception:
                     # Fallback to original content if conversion fails
