@@ -309,7 +309,7 @@ async def _http_request_impl(
                 timeout=timeout_ms / 1000.0,
             )
             # Read full content for caching
-            content = await response.read()
+            content = response.read()
             elapsed_ms = int((time.time() - start_time) * 1000)
 
             content_type = response.headers.get("content-type", "application/octet-stream")
