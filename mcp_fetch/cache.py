@@ -2,35 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return default
-
-
-def _env_path(name: str, default: str) -> Path:
-    return Path(os.environ.get(name, default)).resolve()
+from .base.env import env_int, env_path
 
 
 @dataclass
 class CacheConfig:
-    cache_dir: Path = field(default_factory=lambda: _env_path("MCP_FETCH_CACHE_DIR", "./.mcp-fetch-cache"))
-    ttl_seconds: int = field(default_factory=lambda: _env_int("MCP_FETCH_TTL_SECONDS", 1800))
+    cache_dir: Path = field(default_factory=lambda: env_path("MCP_FETCH_CACHE_DIR", "./.fetch/cache"))
+    ttl_seconds: int = field(default_factory=lambda: env_int("MCP_FETCH_TTL_SECONDS", 1800))
     max_cache_bytes_total: int = field(
-        default_factory=lambda: _env_int("MCP_FETCH_MAX_CACHE_BYTES_TOTAL", 512 * 1024 * 1024))
+        default_factory=lambda: env_int("MCP_FETCH_MAX_CACHE_BYTES_TOTAL", 512 * 1024 * 1024))
     max_single_transfer_bytes: int = field(
-        default_factory=lambda: _env_int("MCP_FETCH_MAX_SINGLE_TRANSFER_BYTES", 200 * 1024 * 1024))
+        default_factory=lambda: env_int("MCP_FETCH_MAX_SINGLE_TRANSFER_BYTES", 200 * 1024 * 1024))
     wait_chunk_timeout_seconds: int = field(
-        default_factory=lambda: _env_int("MCP_FETCH_WAIT_CHUNK_TIMEOUT_SECONDS", 30))
+        default_factory=lambda: env_int("MCP_FETCH_WAIT_CHUNK_TIMEOUT_SECONDS", 30))
 
 
 @dataclass
@@ -52,7 +42,7 @@ class Transfer:
     def touch(self) -> None:
         self.last_access = time.time()
 
-    async def read_chunk(self, offset: int, size: int, *, wait_timeout_seconds: int) -> Tuple[bytes, int, bool]:
+    async def read_chunk(self, offset: int, size: int, *, wait_timeout_seconds: int) -> tuple[bytes, int, bool]:
         if offset < 0:
             offset = 0
         if size <= 0:
@@ -153,7 +143,7 @@ class TransferCache:
             self._evict_if_needed_locked()
             return transfer
 
-    async def get(self, transfer_id: str) -> Optional[Transfer]:
+    async def get(self, transfer_id: str) -> Transfer | None:
         async with self._lock:
             t = self._transfers.get(transfer_id)
             if t is None:
@@ -164,18 +154,20 @@ class TransferCache:
 
 
 def encode_chunk_for_json(data: bytes, content_type: Optional[str]) -> Dict[str, Any]:
-    if not data:
-        return {"chunk_base64": "", "chunk_text": None}
     text_like = False
     if content_type:
         ct = content_type.lower()
         if ct.startswith("text/") or "json" in ct or "xml" in ct or "javascript" in ct:
             text_like = True
+    if not data:
+        if text_like:
+            return {"chunk": {"type": "text", "content": ""}}
+        return {"chunk": {"type": "base64", "content": ""}}
     if text_like:
         try:
-            # If text decoding succeeds, return only chunk_text
-            return {"chunk_base64": None, "chunk_text": data.decode("utf-8")}
+            return {"chunk": {"type": "text", "content": data.decode("utf-8")}}
+        except UnicodeDecodeError:
+            return {"chunk": {"type": "text", "content": data.decode("utf-8", errors="replace")}}
         except Exception:
-            pass
-    # Fallback or binary: return only chunk_base64
-    return {"chunk_base64": base64.b64encode(data).decode("ascii"), "chunk_text": None}
+            return {"chunk": {"type": "text", "content": data.decode("utf-8", errors="replace")}}
+    return {"chunk": {"type": "base64", "content": base64.b64encode(data).decode("ascii")}}

@@ -1,6 +1,6 @@
 [project]
 name = "mcp-fetch"
-version = "0.1.3"
+version = "0.1.5"
 description = "Minimal MCP server providing a generic HTTP request tool with chunked responses and caching."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -54,5 +54,5 @@ class TestCacheUnit(unittest.IsolatedAsyncioTestCase):
 
     def test_encode_chunk_for_json_text_like(self) -> None:
         out = encode_chunk_for_json(b'{"a":1}', "application/json; charset=utf-8")
-        self.assertEqual(out["chunk_text"], '{"a":1}')
-        self.assertTrue(out["chunk_base64"])
+        self.assertEqual(out["chunk"]["type"], "text")
+        self.assertEqual(out["chunk"]["content"], '{"a":1}')

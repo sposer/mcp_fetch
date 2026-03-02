@@ -50,21 +50,22 @@ class TestFetchPageChunking(unittest.IsolatedAsyncioTestCase):
                 out = await _fetch_page_impl(url="http://example.com/", to_markdown=False, chunk_bytes=5)
                 self.assertTrue(out["ok"])
                 self.assertIsNotNone(out.get("transfer_id"))
-                self.assertEqual(out["chunk_text"], "<html")
+                self.assertEqual(out["chunk"]["type"], "text")
+                self.assertEqual(out["chunk"]["content"], "<html")
                 self.assertFalse(out["done"])
 
                 out2 = await _fetch_page_impl(transfer_id=out["transfer_id"], offset=out["next_offset"],
                                               chunk_bytes=1024)
                 self.assertTrue(out2["ok"])
                 self.assertTrue(out2["done"])
-                self.assertIn("hello world", out2["chunk_text"])
+                self.assertEqual(out2["chunk"]["type"], "text")
+                self.assertIn("hello world", out2["chunk"]["content"])
 
 
 class TestAutoShutdown(unittest.TestCase):
     def test_main_calls_resource_close(self) -> None:
-        with patch.dict(os.environ, {"MCP_FETCH_TRANSPORT": "stdio"}), patch("mcp_fetch.server.mcp.run",
-                                                                             new=lambda **kwargs: None), patch(
-            "mcp_fetch.server._close_resources_sync"
+        with patch("mcp_fetch.server.mcp.run", new=lambda **kwargs: None), patch(
+                "mcp_fetch.server._close_resources_sync"
         ) as closer:
             main()
             self.assertTrue(closer.called)
@@ -103,13 +104,15 @@ class TestHttpRequest(unittest.IsolatedAsyncioTestCase):
                 # Test basic JSON
                 res = await _http_request_impl(url="http://api.example.com/", to_markdown=False)
                 self.assertTrue(res["ok"])
-                self.assertEqual(res["chunk_text"], '{"a": 1}')
+                self.assertEqual(res["chunk"]["type"], "text")
+                self.assertEqual(res["chunk"]["content"], '{"a": 1}')
                 self.assertEqual(res["content_type"], "application/json")
 
                 # Test markdown conversion (should NOT happen for JSON)
                 res = await _http_request_impl(url="http://api.example.com/", to_markdown=True)
                 self.assertTrue(res["ok"])
-                self.assertEqual(res["chunk_text"], '{"a": 1}')
+                self.assertEqual(res["chunk"]["type"], "text")
+                self.assertEqual(res["chunk"]["content"], '{"a": 1}')
                 self.assertEqual(res["content_type"], "application/json")
 
     async def test_http_request_markdown_conversion(self) -> None:
@@ -134,7 +137,8 @@ class TestHttpRequest(unittest.IsolatedAsyncioTestCase):
                 # Test markdown conversion
                 res = await _http_request_impl(url="http://example.com/", to_markdown=True)
                 self.assertTrue(res["ok"])
-                self.assertIn("# Hello", res["chunk_text"])
+                self.assertEqual(res["chunk"]["type"], "text")
+                self.assertIn("# Hello", res["chunk"]["content"])
                 self.assertIn("text/markdown", res["content_type"])
 
 

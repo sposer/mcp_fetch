@@ -3,19 +3,19 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
-import os
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 from urllib.parse import urlencode, urlparse, urlunparse
 
 import httpx
 from fastmcp import FastMCP
 
+from .base.env import env_bool, env_int, env_str
+from .base.logging import configure_logging
 from .cache import CacheConfig, TransferCache, encode_chunk_for_json
 from .converter import html_to_markdown
 from .crawler import close_default_crawler, get_default_crawler
-from .logging_utils import configure_logging
 
 
 def _only_http_https(url: str) -> None:
@@ -26,7 +26,7 @@ def _only_http_https(url: str) -> None:
         raise ValueError("URL missing host")
 
 
-def _merge_query(url: str, query: Optional[Dict[str, Any]]) -> str:
+def _merge_query(url: str, query: dict[str, Any] | None) -> str:
     if not query:
         return url
     parsed = urlparse(url)
@@ -48,7 +48,7 @@ _log = logging.getLogger("mcp_fetch.server")
 
 mcp = FastMCP("mcp-fetch")
 
-_http_client: Optional[httpx.AsyncClient] = None
+_http_client: httpx.AsyncClient | None = None
 
 
 async def _get_http_client() -> httpx.AsyncClient:
@@ -73,7 +73,7 @@ async def _close_http_client() -> None:
 
 async def _read_chunk_impl(
         transfer_id: str, offset: int, chunk_bytes: int, to_markdown: bool = False
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     transfer = await _cache.get(transfer_id)
     if transfer is None:
         return {"ok": False, "error": {"type": "not_found", "message": "Unknown transfer_id"}}
@@ -81,7 +81,7 @@ async def _read_chunk_impl(
     data, next_offset, done = await transfer.read_chunk(
         offset=int(offset or 0), size=chunk_bytes, wait_timeout_seconds=_config.wait_chunk_timeout_seconds
     )
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "ok": transfer.error is None,
         "transfer_id": transfer.transfer_id,
         "offset": int(offset or 0),
@@ -102,22 +102,22 @@ async def _read_chunk_impl(
 
 
 async def _fetch_page_impl(
-        url: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-        query: Optional[Dict[str, Any]] = None,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
         timeout_ms: float = 30000,
         to_markdown: bool = True,
-        wait_selector: Optional[str] = None,
+        wait_selector: str | None = None,
         max_scrolls: int = 8,
         min_delay_ms: int = 150,
         max_delay_ms: int = 450,
-        proxy: Optional[str] = None,
-        proxy_pool: Optional[list[str]] = None,
-        user_agent: Optional[str] = None,
+        proxy: str | None = None,
+        proxy_pool: list[str] | None = None,
+        user_agent: str | None = None,
         chunk_bytes: int = 262144,
-        transfer_id: Optional[str] = None,
+        transfer_id: str | None = None,
         offset: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     chunk_bytes = int(chunk_bytes or 262144)
     if chunk_bytes <= 0:
         chunk_bytes = 1
@@ -203,22 +203,22 @@ async def _fetch_page_impl(
 
 @mcp.tool
 async def fetch_page(
-        url: Optional[str] = None,
-        headers: Optional[Dict[str, str]] = None,
-        query: Optional[Dict[str, Any]] = None,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
         timeout_ms: float = 30000,
         to_markdown: bool = True,
-        wait_selector: Optional[str] = None,
+        wait_selector: str | None = None,
         max_scrolls: int = 8,
         min_delay_ms: int = 150,
         max_delay_ms: int = 450,
-        proxy: Optional[str] = None,
-        proxy_pool: Optional[list[str]] = None,
-        user_agent: Optional[str] = None,
+        proxy: str | None = None,
+        proxy_pool: list[str] | None = None,
+        user_agent: str | None = None,
         chunk_bytes: int = 48000,
-        transfer_id: Optional[str] = None,
+        transfer_id: str | None = None,
         offset: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Fetch/Crawl a dynamic web page and convert to Markdown (supports JavaScript).
 
     Use this tool to:
@@ -239,7 +239,7 @@ async def fetch_page(
       - Cursor: transfer_id, offset (for phase 2)
 
     Returns:
-      - Chunk: chunk_text or chunk_base64, next_offset, done, truncated
+      - Chunk: chunk{type, content}, next_offset, done, truncated
       - Meta: transfer_id, status, headers, final_url, content_type, elapsed_ms
       - Size: available_bytes, total_bytes
     """
@@ -263,18 +263,18 @@ async def fetch_page(
 
 
 async def _http_request_impl(
-        url: Optional[str] = None,
+        url: str | None = None,
         method: str = "GET",
-        headers: Optional[Dict[str, str]] = None,
-        query: Optional[Dict[str, Any]] = None,
-        body: Optional[str] = None,
-        json_body: Optional[Dict[str, Any]] = None,
+        headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
+        body: str | None = None,
+        json_body: dict[str, Any] | None = None,
         timeout_ms: float = 30000,
         to_markdown: bool = True,
         chunk_bytes: int = 262144,
-        transfer_id: Optional[str] = None,
+        transfer_id: str | None = None,
         offset: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     chunk_bytes = int(chunk_bytes or 262144)
     if chunk_bytes <= 0:
         chunk_bytes = 1
@@ -366,18 +366,18 @@ async def _http_request_impl(
 
 @mcp.tool
 async def http_request(
-        url: Optional[str] = None,
+        url: str | None = None,
         method: str = "GET",
-        headers: Optional[Dict[str, str]] = None,
-        query: Optional[Dict[str, Any]] = None,
-        body: Optional[str] = None,
-        json_body: Optional[Dict[str, Any]] = None,
+        headers: dict[str, str] | None = None,
+        query: dict[str, Any] | None = None,
+        body: str | None = None,
+        json_body: dict[str, Any] | None = None,
         timeout_ms: float = 30000,
         to_markdown: bool = True,
         chunk_bytes: int = 262144,
-        transfer_id: Optional[str] = None,
+        transfer_id: str | None = None,
         offset: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Perform a generic HTTP request (GET, POST, PUT, DELETE, etc) for APIs or raw data.
 
     Use this tool when:
@@ -406,14 +406,14 @@ async def http_request(
     )
 
 
-async def shutdown() -> Dict[str, Any]:
+async def shutdown() -> dict[str, Any]:
     """Release browser resources early when embedding this server in a long-lived process."""
     await close_default_crawler()
     await _close_http_client()
     return {"ok": True}
 
 
-if os.environ.get("MCP_FETCH_EXPOSE_SHUTDOWN") == "1":
+if env_bool("MCP_FETCH_EXPOSE_SHUTDOWN", False):
     shutdown = mcp.tool(shutdown)
 
 
@@ -437,36 +437,18 @@ def _close_resources_sync() -> None:
 
 
 def main() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(add_help=True)
-    parser.add_argument("--transport", choices=["stdio", "http"], default=None)
-    parser.add_argument("--port", type=int, default=int(os.environ.get("MCP_FETCH_PORT", "8000")))
-    parsed, _unknown = parser.parse_known_args()
-
-    transport = parsed.transport or os.environ.get("MCP_FETCH_TRANSPORT")
-    if not transport:
-        transport = "http" if sys.stdin.isatty() else "stdio"
-
     logging.getLogger("fastmcp").setLevel(logging.WARNING)
     logging.getLogger("fastmcp").propagate = False
 
     atexit.register(_close_resources_sync)
 
-    if transport == "http":
-        try:
-            mcp.run(transport="http", port=int(parsed.port))
-        finally:
-            _close_resources_sync()
-        return
-
     try:
-        try:
-            mcp.run()
-        finally:
-            _close_resources_sync()
+        # Always run in stdio mode
+        mcp.run()
     except BaseException as e:
         # When started without an MCP host, stdin may close immediately; FastMCP/anyio can surface this as CancelledError.
         if type(e).__name__ == "CancelledError":
             return
         raise
+    finally:
+        _close_resources_sync()

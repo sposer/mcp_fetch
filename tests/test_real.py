@@ -38,7 +38,7 @@ class TestZhihuReal(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.get("ok"), f"Fetch failed: {result.get('error')}")
         self.assertTrue(result.get("to_markdown"))
 
-        content = result.get("chunk_text", "")
+        content = (result.get("chunk") or {}).get("content", "")
         print(f"\n--- Result Preview (First 500 chars) ---\n")
         print(content[:500])
         print(f"\n--- End Preview ---\n")
